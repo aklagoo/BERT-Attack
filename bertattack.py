@@ -1,3 +1,6 @@
+# Adapted from https://github.com/LinyangLee/BERT-Attack
+#
+# Original information as follows:
 # -*- coding: utf-8 -*-
 # @Time    : 2020/6/10
 # @Author  : Linyang Li
@@ -8,15 +11,16 @@
 import warnings
 import os
 
+import numpy as np
 import torch
 import torch.nn as nn
-import json
 from torch.utils.data import DataLoader, SequentialSampler, TensorDataset
-from transformers import BertConfig, BertTokenizer
-from transformers import BertForSequenceClassification, BertForMaskedLM
 import copy
 import argparse
-import numpy as np
+from src.evaluate import evaluate
+from src.utils import load_similarity_embed, load_dataset, Feature, dump_features, load_models
+from transformers import BertForMaskedLM, BertForSequenceClassification, BertTokenizer
+from typing import Optional
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 warnings.simplefilter(action='ignore', category=FutureWarning)
@@ -49,45 +53,6 @@ filter_words = ['a', 'about', 'above', 'across', 'after', 'afterwards', 'again',
 filter_words = set(filter_words)
 
 
-def get_sim_embed(embed_path, sim_path):
-    id2word = {}
-    word2id = {}
-
-    with open(embed_path, 'r', encoding='utf-8') as ifile:
-        for line in ifile:
-            word = line.split()[0]
-            if word not in id2word:
-                id2word[len(id2word)] = word
-                word2id[word] = len(id2word) - 1
-
-    cos_sim = np.load(sim_path)
-    return cos_sim, word2id, id2word
-
-
-def get_data_cls(data_path):
-    lines = open(data_path, 'r', encoding='utf-8').readlines()[1:]
-    features = []
-    for i, line in enumerate(lines):
-        split = line.strip('\n').split('\t')
-        label = int(split[-1])
-        seq = split[0]
-
-        features.append([seq, label])
-    return features
-
-
-class Feature(object):
-    def __init__(self, seq_a, label):
-        self.label = label
-        self.seq = seq_a
-        self.final_adverse = seq_a
-        self.query = 0
-        self.change = 0
-        self.success = 0
-        self.sim = 0.0
-        self.changes = []
-
-
 def _tokenize(seq, tokenizer):
     seq = seq.replace('\n', '').lower()
     words = seq.split(' ')
@@ -117,22 +82,25 @@ def get_important_scores(words, tgt_model, orig_prob, orig_label, orig_probs, to
     masked_words = _get_masked(words)
     texts = [' '.join(words) for words in masked_words]  # list of text of masked words
     all_input_ids = []
-    all_masks = []
-    all_segs = []
+    # all_masks = []
+    # all_segs = []
     for text in texts:
-        inputs = tokenizer.encode_plus(text, None, add_special_tokens=True, max_length=max_length, )
+        inputs = tokenizer.encode_plus(
+            text,
+            None, add_special_tokens=True, max_length=max_length, truncation='longest_first'
+        )
         input_ids, token_type_ids = inputs["input_ids"], inputs["token_type_ids"]
         attention_mask = [1] * len(input_ids)
         padding_length = max_length - len(input_ids)
         input_ids = input_ids + (padding_length * [0])
-        token_type_ids = token_type_ids + (padding_length * [0])
-        attention_mask = attention_mask + (padding_length * [0])
+        # token_type_ids = token_type_ids + (padding_length * [0])
+        # attention_mask = attention_mask + (padding_length * [0])
         all_input_ids.append(input_ids)
-        all_masks.append(attention_mask)
-        all_segs.append(token_type_ids)
+        # all_masks.append(attention_mask)
+        # all_segs.append(token_type_ids)
     seqs = torch.tensor(all_input_ids, dtype=torch.long)
-    masks = torch.tensor(all_masks, dtype=torch.long)
-    segs = torch.tensor(all_segs, dtype=torch.long)
+    # masks = torch.tensor(all_masks, dtype=torch.long)
+    # segs = torch.tensor(all_segs, dtype=torch.long)
     seqs = seqs.to('cuda')
 
     eval_data = TensorDataset(seqs)
@@ -149,6 +117,7 @@ def get_important_scores(words, tgt_model, orig_prob, orig_label, orig_probs, to
     leave_1_probs = torch.cat(leave_1_probs, dim=0)  # words, num-label
     leave_1_probs = torch.softmax(leave_1_probs, -1)  #
     leave_1_probs_argmax = torch.argmax(leave_1_probs, dim=-1)
+    # noinspection PyUnresolvedReferences
     import_scores = (orig_prob
                      - leave_1_probs[:, orig_label]
                      +
@@ -159,8 +128,8 @@ def get_important_scores(words, tgt_model, orig_prob, orig_label, orig_probs, to
     return import_scores
 
 
-def get_substitues(substitutes, tokenizer, mlm_model, use_bpe, substitutes_score=None, threshold=3.0):
-    # substitues L,k
+def get_substitutes(substitutes, tokenizer, mlm_model, use_bpe, substitutes_score=None, threshold=3.0):
+    # substitutes L,k
     # from this matrix to recover a word
     words = []
     sub_len, k = substitutes.size()  # sub-len, k
@@ -175,7 +144,7 @@ def get_substitues(substitutes, tokenizer, mlm_model, use_bpe, substitutes_score
             words.append(tokenizer._convert_id_to_token(int(i)))
     else:
         if use_bpe == 1:
-            words = get_bpe_substitues(substitutes, tokenizer, mlm_model)
+            words = get_bpe_substitutes(substitutes, tokenizer, mlm_model)
         else:
             return words
     #
@@ -183,7 +152,7 @@ def get_substitues(substitutes, tokenizer, mlm_model, use_bpe, substitutes_score
     return words
 
 
-def get_bpe_substitues(substitutes, tokenizer, mlm_model):
+def get_bpe_substitutes(substitutes, tokenizer, mlm_model):
     # substitutes L, k
 
     substitutes = substitutes[0:12, 0:4] # maximum BPE candidates
@@ -223,22 +192,33 @@ def get_bpe_substitues(substitutes, tokenizer, mlm_model):
     return final_words
 
 
-def attack(feature, tgt_model, mlm_model, tokenizer, k, batch_size, max_length=512, cos_mat=None, w2i={}, i2w={}, use_bpe=1, threshold_pred_score=0.3):
+def attack(
+        feature: Feature, tgt_model: BertForSequenceClassification, mlm_model: BertForMaskedLM,
+        tokenizer: BertTokenizer, k: int, batch_size: int, max_length: int = 512, cos_mat: Optional[np.ndarray] = None,
+        w2i: Optional[dict] = None, i2w: Optional[dict] = None, use_bpe: int = 1, threshold_pred_score: float = 0.3):
+    """Performs all substitution attacks on the BERT model."""
     # MLM-process
+    if i2w is None:
+        i2w = {}
+    if w2i is None:
+        w2i = {}
     words, sub_words, keys = _tokenize(feature.seq, tokenizer)
 
-    # original label
-    inputs = tokenizer.encode_plus(feature.seq, None, add_special_tokens=True, max_length=max_length, )
+    # Prepare feature for prediction
+    inputs = tokenizer.encode_plus(
+        feature.seq, None, add_special_tokens=True, max_length=max_length, truncation='longest_first'
+    )
     input_ids, token_type_ids = torch.tensor(inputs["input_ids"]), torch.tensor(inputs["token_type_ids"])
     attention_mask = torch.tensor([1] * len(input_ids))
-    seq_len = input_ids.size(0)
-    orig_probs = tgt_model(input_ids.unsqueeze(0).to('cuda'),
-                           attention_mask.unsqueeze(0).to('cuda'),
-                           token_type_ids.unsqueeze(0).to('cuda')
-                           )[0].squeeze()
-    orig_probs = torch.softmax(orig_probs, -1)
-    orig_label = torch.argmax(orig_probs)
-    current_prob = orig_probs.max()
+
+    # Perform prediction on original sample
+    orig_predictions = tgt_model(
+        input_ids.unsqueeze(0).to('cuda'), attention_mask.unsqueeze(0).to('cuda'),
+        token_type_ids.unsqueeze(0).to('cuda')
+    )[0].squeeze()
+    orig_predictions = torch.softmax(orig_predictions, -1)
+    orig_label = torch.argmax(orig_predictions)
+    current_prob = orig_predictions.max()
 
     if orig_label != feature.label:
         feature.success = 3
@@ -252,7 +232,7 @@ def attack(feature, tgt_model, mlm_model, tokenizer, k, batch_size, max_length=5
     word_predictions = word_predictions[1:len(sub_words) + 1, :]
     word_pred_scores_all = word_pred_scores_all[1:len(sub_words) + 1, :]
 
-    important_scores = get_important_scores(words, tgt_model, current_prob, orig_label, orig_probs,
+    important_scores = get_important_scores(words, tgt_model, current_prob, orig_label, orig_predictions,
                                             tokenizer, batch_size, max_length)
     feature.query += int(len(words))
     list_of_index = sorted(enumerate(important_scores), key=lambda x: x[1], reverse=True)
@@ -270,12 +250,11 @@ def attack(feature, tgt_model, mlm_model, tokenizer, k, batch_size, max_length=5
         if keys[top_index[0]][0] > max_length - 2:
             continue
 
-
         substitutes = word_predictions[keys[top_index[0]][0]:keys[top_index[0]][1]]  # L, k
         word_pred_scores = word_pred_scores_all[keys[top_index[0]][0]:keys[top_index[0]][1]]
 
-        substitutes = get_substitues(substitutes, tokenizer, mlm_model, use_bpe, word_pred_scores, threshold_pred_score)
-
+        substitutes = get_substitutes(substitutes, tokenizer, mlm_model, use_bpe, word_pred_scores,
+                                      threshold_pred_score)
 
         most_gap = 0.0
         candidate = None
@@ -296,7 +275,7 @@ def attack(feature, tgt_model, mlm_model, tokenizer, k, batch_size, max_length=5
             temp_replace = final_words
             temp_replace[top_index[0]] = substitute
             temp_text = tokenizer.convert_tokens_to_string(temp_replace)
-            inputs = tokenizer.encode_plus(temp_text, None, add_special_tokens=True, max_length=max_length, )
+            inputs = tokenizer.encode_plus(temp_text, None, add_special_tokens=True, max_length=max_length, truncation='longest_first')
             input_ids = torch.tensor(inputs["input_ids"]).unsqueeze(0).to('cuda')
             seq_len = input_ids.size(1)
             temp_prob = tgt_model(input_ids)[0].squeeze()
@@ -330,177 +309,90 @@ def attack(feature, tgt_model, mlm_model, tokenizer, k, batch_size, max_length=5
     return feature
 
 
-def evaluate(features):
-    do_use = 0
-    use = None
-    sim_thres = 0
-    # evaluate with USE
+def main():
+    # Parse arguments
+    args = parse_args()
 
-    if do_use == 1:
-        cache_path = ''
-        import tensorflow as tf
-        import tensorflow_hub as hub
-    
-        class USE(object):
-            def __init__(self, cache_path):
-                super(USE, self).__init__()
+    print('Starting process...')
+    # Load required models, tokenizers, and dataset
+    model_mlm, model_target, tokenizer_target = load_models(args)
+    samples = load_dataset(args.data_path)
 
-                self.embed = hub.Module(cache_path)
-                config = tf.ConfigProto()
-                config.gpu_options.allow_growth = True
-                self.sess = tf.Session()
-                self.build_graph()
-                self.sess.run([tf.global_variables_initializer(), tf.tables_initializer()])
-
-            def build_graph(self):
-                self.sts_input1 = tf.placeholder(tf.string, shape=(None))
-                self.sts_input2 = tf.placeholder(tf.string, shape=(None))
-
-                sts_encode1 = tf.nn.l2_normalize(self.embed(self.sts_input1), axis=1)
-                sts_encode2 = tf.nn.l2_normalize(self.embed(self.sts_input2), axis=1)
-                self.cosine_similarities = tf.reduce_sum(tf.multiply(sts_encode1, sts_encode2), axis=1)
-                clip_cosine_similarities = tf.clip_by_value(self.cosine_similarities, -1.0, 1.0)
-                self.sim_scores = 1.0 - tf.acos(clip_cosine_similarities)
-
-            def semantic_sim(self, sents1, sents2):
-                sents1 = [s.lower() for s in sents1]
-                sents2 = [s.lower() for s in sents2]
-                scores = self.sess.run(
-                    [self.sim_scores],
-                    feed_dict={
-                        self.sts_input1: sents1,
-                        self.sts_input2: sents2,
-                    })
-                return scores[0]
-
-            use = USE(cache_path)
-
-
-    acc = 0
-    origin_success = 0
-    total = 0
-    total_q = 0
-    total_change = 0
-    total_word = 0
-    for feat in features:
-        if feat.success > 2:
-
-            if do_use == 1:
-                sim = float(use.semantic_sim([feat.seq], [feat.final_adverse]))
-                if sim < sim_thres:
-                    continue
-            
-            acc += 1
-            total_q += feat.query
-            total_change += feat.change
-            total_word += len(feat.seq.split(' '))
-
-            if feat.success == 3:
-                origin_success += 1
-
-        total += 1
-
-    suc = float(acc / total)
-
-    query = float(total_q / acc)
-    change_rate = float(total_change / total_word)
-
-    origin_acc = 1 - origin_success / total
-    after_atk = 1 - suc
-
-    print('acc/aft-atk-acc {:.6f}/ {:.6f}, query-num {:.4f}, change-rate {:.4f}'.format(origin_acc, after_atk, query, change_rate))
-
-
-def dump_features(features, output):
-    outputs = []
-
-    for feature in features:
-        outputs.append({'label': feature.label,
-                        'success': feature.success,
-                        'change': feature.change,
-                        'num_word': len(feature.seq.split(' ')),
-                        'query': feature.query,
-                        'changes': feature.changes,
-                        'seq_a': feature.seq,
-                        'adv': feature.final_adverse,
-                        })
-    output_json = output
-    json.dump(outputs, open(output_json, 'w'), indent=2)
-
-    print('finished dump')
-
-
-def run_attack():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data_path", type=str, help="./data/xxx")
-    parser.add_argument("--mlm_path", type=str, help="xxx mlm")
-    parser.add_argument("--tgt_path", type=str, help="xxx classifier")
-
-    parser.add_argument("--output_dir", type=str, help="train file")
-    parser.add_argument("--use_sim_mat", type=int, help='whether use cosine_similarity to filter out atonyms')
-    parser.add_argument("--start", type=int, help="start step, for multi-thread process")
-    parser.add_argument("--end", type=int, help="end step, for multi-thread process")
-    parser.add_argument("--num_label", type=int, )
-    parser.add_argument("--use_bpe", type=int, )
-    parser.add_argument("--k", type=int, )
-    parser.add_argument("--threshold_pred_score", type=float, )
-
-
-    args = parser.parse_args()
-    data_path = str(args.data_path)
-    mlm_path = str(args.mlm_path)
-    tgt_path = str(args.tgt_path)
-    output_dir = str(args.output_dir)
-    num_label = args.num_label
-    use_bpe = args.use_bpe
-    k = args.k
-    start = args.start
-    end = args.end
-    threshold_pred_score = args.threshold_pred_score
-
-    print('start process')
-
-    tokenizer_mlm = BertTokenizer.from_pretrained(mlm_path, do_lower_case=True)
-    tokenizer_tgt = BertTokenizer.from_pretrained(tgt_path, do_lower_case=True)
-
-    config_atk = BertConfig.from_pretrained(mlm_path)
-    mlm_model = BertForMaskedLM.from_pretrained(mlm_path, config=config_atk)
-    mlm_model.to('cuda')
-
-    config_tgt = BertConfig.from_pretrained(tgt_path, num_labels=num_label)
-    tgt_model = BertForSequenceClassification.from_pretrained(tgt_path, config=config_tgt)
-    tgt_model.to('cuda')
-    features = get_data_cls(data_path)
-    print('loading sim-embed')
-    
     if args.use_sim_mat == 1:
-        cos_mat, w2i, i2w = get_sim_embed('data_defense/counter-fitted-vectors.txt', 'data_defense/cos_sim_counter_fitting.npy')
+        print('\tLoading similarity embeddings...')
+        cos_mat, w2i, i2w = load_similarity_embed(
+            'data_defense/counter-fitted-vectors.txt',
+            'data_defense/cos_sim_counter_fitting.npy',
+        )
     else:        
         cos_mat, w2i, i2w = None, {}, {}
 
-    print('finish get-sim-embed')
+    print("\tPerforming attacks...")
     features_output = []
-
     with torch.no_grad():
-        for index, feature in enumerate(features[start:end]):
-            seq_a, label = feature
-            feat = Feature(seq_a, label)
-            print('\r number {:d} '.format(index) + tgt_path, end='')
-            # print(feat.seq[:100], feat.label)
-            feat = attack(feat, tgt_model, mlm_model, tokenizer_tgt, k, batch_size=32, max_length=512,
-                          cos_mat=cos_mat, w2i=w2i, i2w=i2w, use_bpe=use_bpe,threshold_pred_score=threshold_pred_score)
+        print()
+        n = args.end - args.start
+        for index, feature in enumerate(samples[args.start:args.end]):
+            # Convert sample to object with embedded metrics
+            feature = Feature(*feature)
 
-            # print(feat.changes, feat.change, feat.query, feat.success)
-            if feat.success > 2:
-                print('success', end='')
+            # Perform attacks on the sample
+            print('\r\t\t[{:d} / {:d}] '.format(index, n), end='')
+            feature = attack(
+                feature, model_target, model_mlm, tokenizer_target, args.k, batch_size=32, max_length=512,
+                cos_mat=cos_mat, w2i=w2i, i2w=i2w, use_bpe=args.use_bpe, threshold_pred_score=args.threshold_pred_score
+            )
+
+            if feature.success > 2:
+                print('Successful', end='')
             else:
-                print('failed', end='')
-            features_output.append(feat)
+                print('Failed', end='')
+            features_output.append(feature)
 
+    # Evaluate and save
+    print("\r\tEvaluating performance")
     evaluate(features_output)
 
-    dump_features(features_output, output_dir)
+    print("\r\tSaving files")
+    dump_features(features_output, args.output_dir)
+
+    print("Completed")
+
+
+def parse_args() -> argparse.Namespace:
+    """Load and parse arguments.
+
+    The parser accepts the following arguments:
+        data_path: Path to the TSV dataset file.
+        mlm_path: Path to the directory containing the MLM model.
+        tgt_path: Path to the directory containing the classifier.
+        output_dir: Path to experiment results. Must be a directory.
+        use_sim_mat: Flag to set if cosine similarity is used to filter antonyms.
+        start: Starting step. Usable for multi-threaded processing.
+        start: Ending step. Usable for multi-threaded processing.
+        num_label: Number of labels.
+        use_bpe: TODO Read about BPE and fill in
+        k: Number of words to be tested for replacement.
+        threshold_pred_score: Positive prediction threshold.
+    """
+    # Parse all arguments
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_path", type=str, help="Path to the TSV dataset file.")
+    parser.add_argument("--mlm_path", type=str, help="Path to the directory containing the MLM model.")
+    parser.add_argument("--tgt_path", type=str, help="Path to the directory containing the classifier.")
+    parser.add_argument("--output_dir", type=str, help="Path to experiment results. Must be a directory.")
+    parser.add_argument("--use_sim_mat", type=int, help='Flag to set if cosine similarity is used to filter antonyms.')
+    parser.add_argument("--start", type=int, help="Starting step. Usable for multi-threaded processing.")
+    parser.add_argument("--end", type=int, help="Ending step. Usable for multi-threaded processing.")
+    parser.add_argument("--num_label", type=int, help="Number of labels")
+    parser.add_argument("--use_bpe", type=int, help="")
+    parser.add_argument("--k", type=int, help="Number of words to be tested for replacement.")
+    parser.add_argument("--threshold_pred_score", type=float, help="Positive prediction threshold.")
+    args = parser.parse_args()
+
+    # Return namespace
+    return args
 
 
 if __name__ == '__main__':
-    run_attack()
+    main()
