@@ -17,9 +17,9 @@ from torch.utils.data import DataLoader, SequentialSampler, TensorDataset
 import copy
 import argparse
 from src.evaluate import evaluate
-from src.utils import load_similarity_embed, load_dataset, Feature,\
+from src.utils import load_similarity_embed, load_dataset, Feature, \
     dump_features, load_models
-from transformers import BertForMaskedLM, BertForSequenceClassification,\
+from transformers import BertForMaskedLM, BertForSequenceClassification, \
     BertTokenizer
 from typing import Optional, List, Tuple
 
@@ -110,7 +110,8 @@ def generate_importance_scores(source_sent: List[str],
             None, add_special_tokens=True, max_length=max_length,
             truncation='longest_first'
         )
-        input_ids, token_type_ids = inputs["input_ids"], inputs["token_type_ids"]
+        input_ids, token_type_ids = inputs["input_ids"], inputs[
+            "token_type_ids"]
         padding_length = max_length - len(input_ids)
         input_ids = input_ids + (padding_length * [0])
         all_input_ids.append(input_ids)
@@ -120,7 +121,8 @@ def generate_importance_scores(source_sent: List[str],
     eval_data = TensorDataset(seqs)
     # Run prediction for full data
     eval_sampler = SequentialSampler(eval_data)
-    eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=batch_size)
+    eval_dataloader = DataLoader(eval_data, sampler=eval_sampler,
+                                 batch_size=batch_size)
     leave_1_probs = []
     for batch in eval_dataloader:
         masked_input, = batch
@@ -132,17 +134,19 @@ def generate_importance_scores(source_sent: List[str],
     leave_1_probs_argmax = torch.argmax(leave_1_probs, dim=-1)
     # noinspection PyUnresolvedReferences
     import_scores = (
-        orig_prob
-        - leave_1_probs[:, orig_label]
-        +
-        (leave_1_probs_argmax != orig_label).float()
-        * (leave_1_probs.max(dim=-1)[0] - torch.index_select(orig_probs, 0, leave_1_probs_argmax))
+            orig_prob
+            - leave_1_probs[:, orig_label]
+            +
+            (leave_1_probs_argmax != orig_label).float()
+            * (leave_1_probs.max(dim=-1)[0] - torch.index_select(orig_probs, 0,
+                                                                 leave_1_probs_argmax))
     ).data.cpu().numpy()
 
     return import_scores
 
 
-def get_substitutes(substitutes, tokenizer, mlm_model, use_bpe, substitutes_score=None, threshold=3.0):
+def get_substitutes(substitutes, tokenizer, mlm_model, use_bpe,
+                    substitutes_score=None, threshold=3.0):
     # substitutes L,k
     # from this matrix to recover a word
     words = []
@@ -150,7 +154,7 @@ def get_substitutes(substitutes, tokenizer, mlm_model, use_bpe, substitutes_scor
 
     if sub_len == 0:
         return words
-        
+
     elif sub_len == 1:
         for (i, j) in zip(substitutes[0], substitutes_score[0]):
             if threshold != 0 and j < threshold:
@@ -189,13 +193,14 @@ def get_bpe_substitutes(substitutes, tokenizer, mlm_model):
     c_loss = nn.CrossEntropyLoss(reduction='none')
     # word_list = []
     # all_substitutes = all_substitutes[:24]
-    all_substitutes = torch.tensor(all_substitutes) # [ N, L ]
+    all_substitutes = torch.tensor(all_substitutes)  # [ N, L ]
     all_substitutes = all_substitutes[:24].to('cuda')
     # print(substitutes.size(), all_substitutes.size())
     N, L = all_substitutes.size()
     word_predictions = mlm_model(all_substitutes)[0]  # N L vocab-size
-    ppl = c_loss(word_predictions.view(N*L, -1), all_substitutes.view(-1))  # [ N*L ]
-    ppl = torch.exp(torch.mean(ppl.view(N, L), dim=-1)) # N  
+    ppl = c_loss(word_predictions.view(N * L, -1),
+                 all_substitutes.view(-1))  # [ N*L ]
+    ppl = torch.exp(torch.mean(ppl.view(N, L), dim=-1))  # N
     _, word_list = torch.sort(ppl)
     word_list = [all_substitutes[i] for i in word_list]
     final_words = []
@@ -212,7 +217,7 @@ def attack(feature: Feature, tgt_model: BertForSequenceClassification,
            cos_mat: Optional[np.ndarray] = None, w2i: Optional[dict] = None,
            i2w: Optional[dict] = None, use_bpe: int = 1,
            threshold_pred_score: float = 0.3
-):
+           ):
     """Performs all substitution attacks on the BERT model."""
     # MLM-process
     if i2w is None:
@@ -246,16 +251,22 @@ def attack(feature: Feature, tgt_model: BertForSequenceClassification,
 
     sub_words = ['[CLS]'] + sub_words[:max_length - 2] + ['[SEP]']
     input_ids_ = torch.tensor([tokenizer.convert_tokens_to_ids(sub_words)])
-    word_predictions = mlm_model(input_ids_.to('cuda'))[0].squeeze()  # seq-len(sub) vocab
-    word_pred_scores_all, word_predictions = torch.topk(word_predictions, k, -1)  # seq-len k
+    word_predictions = mlm_model(input_ids_.to('cuda'))[
+        0].squeeze()  # seq-len(sub) vocab
+    word_pred_scores_all, word_predictions = torch.topk(word_predictions, k,
+                                                        -1)  # seq-len k
 
     word_predictions = word_predictions[1:len(sub_words) + 1, :]
     word_pred_scores_all = word_pred_scores_all[1:len(sub_words) + 1, :]
 
-    important_scores = generate_importance_scores(words, tgt_model, current_prob, orig_label, orig_predictions,
-                                                  tokenizer, batch_size, max_length)
+    important_scores = generate_importance_scores(words, tgt_model,
+                                                  current_prob, orig_label,
+                                                  orig_predictions,
+                                                  tokenizer, batch_size,
+                                                  max_length)
     feature.query += int(len(words))
-    list_of_index = sorted(enumerate(important_scores), key=lambda x: x[1], reverse=True)
+    list_of_index = sorted(enumerate(important_scores), key=lambda x: x[1],
+                           reverse=True)
     # print(list_of_index)
     final_words = copy.deepcopy(words)
 
@@ -270,10 +281,13 @@ def attack(feature: Feature, tgt_model: BertForSequenceClassification,
         if keys[top_index[0]][0] > max_length - 2:
             continue
 
-        substitutes = word_predictions[keys[top_index[0]][0]:keys[top_index[0]][1]]  # L, k
-        word_pred_scores = word_pred_scores_all[keys[top_index[0]][0]:keys[top_index[0]][1]]
+        substitutes = word_predictions[
+                      keys[top_index[0]][0]:keys[top_index[0]][1]]  # L, k
+        word_pred_scores = word_pred_scores_all[
+                           keys[top_index[0]][0]:keys[top_index[0]][1]]
 
-        substitutes = get_substitutes(substitutes, tokenizer, mlm_model, use_bpe, word_pred_scores,
+        substitutes = get_substitutes(substitutes, tokenizer, mlm_model,
+                                      use_bpe, word_pred_scores,
                                       threshold_pred_score)
 
         most_gap = 0.0
@@ -295,8 +309,12 @@ def attack(feature: Feature, tgt_model: BertForSequenceClassification,
             temp_replace = final_words
             temp_replace[top_index[0]] = substitute
             temp_text = tokenizer.convert_tokens_to_string(temp_replace)
-            inputs = tokenizer.encode_plus(temp_text, None, add_special_tokens=True, max_length=max_length, truncation='longest_first')
-            input_ids = torch.tensor(inputs["input_ids"]).unsqueeze(0).to('cuda')
+            inputs = tokenizer.encode_plus(temp_text, None,
+                                           add_special_tokens=True,
+                                           max_length=max_length,
+                                           truncation='longest_first')
+            input_ids = torch.tensor(inputs["input_ids"]).unsqueeze(0).to(
+                'cuda')
             seq_len = input_ids.size(1)
             temp_prob = tgt_model(input_ids)[0].squeeze()
             feature.query += 1
@@ -306,7 +324,8 @@ def attack(feature: Feature, tgt_model: BertForSequenceClassification,
             if temp_label != orig_label:
                 feature.change += 1
                 final_words[top_index[0]] = substitute
-                feature.changes.append([keys[top_index[0]][0], substitute, tgt_word])
+                feature.changes.append(
+                    [keys[top_index[0]][0], substitute, tgt_word])
                 feature.final_adverse = temp_text
                 feature.success = 4
                 return feature
@@ -329,19 +348,21 @@ def attack(feature: Feature, tgt_model: BertForSequenceClassification,
     return feature
 
 
-def main(args: dict):
+def main(args: dict, sim_directory: str = None):
     print('Starting process...')
     # Load required models, tokenizers, and dataset
     model_mlm, model_target, tokenizer_target = load_models(args)
     samples = load_dataset(args["data_path"])
 
     if args["use_sim_mat"] == 1:
+        if sim_directory is None:
+            sim_directory = "data_defense"
         print('\tLoading similarity embeddings...')
         cos_mat, w2i, i2w = load_similarity_embed(
-            'data_defense/counter-fitted-vectors.txt',
-            'data_defense/cos_sim_counter_fitting.npy',
+            sim_directory + '/counter-fitted-vectors.txt',
+            sim_directory + '/cos_sim_counter_fitting.npy',
         )
-    else:        
+    else:
         cos_mat, w2i, i2w = None, {}, {}
 
     print("\tPerforming attacks...")
@@ -396,17 +417,26 @@ def parse_args() -> dict:
     """
     # Parse all arguments
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_path", type=str, help="Path to the TSV dataset file.")
-    parser.add_argument("--mlm_path", type=str, help="Path to the directory containing the MLM model.")
-    parser.add_argument("--tgt_path", type=str, help="Path to the directory containing the classifier.")
-    parser.add_argument("--output_dir", type=str, help="Path to experiment results. Must be a directory.")
-    parser.add_argument("--use_sim_mat", type=int, help='Flag to set if cosine similarity is used to filter antonyms.')
-    parser.add_argument("--start", type=int, help="Starting step. Usable for multi-threaded processing.")
-    parser.add_argument("--end", type=int, help="Ending step. Usable for multi-threaded processing.")
+    parser.add_argument("--data_path", type=str,
+                        help="Path to the TSV dataset file.")
+    parser.add_argument("--mlm_path", type=str,
+                        help="Path to the directory containing the MLM model.")
+    parser.add_argument("--tgt_path", type=str,
+                        help="Path to the directory containing the classifier.")
+    parser.add_argument("--output_dir", type=str,
+                        help="Path to experiment results. Must be a directory.")
+    parser.add_argument("--use_sim_mat", type=int,
+                        help='Flag to set if cosine similarity is used to filter antonyms.')
+    parser.add_argument("--start", type=int,
+                        help="Starting step. Usable for multi-threaded processing.")
+    parser.add_argument("--end", type=int,
+                        help="Ending step. Usable for multi-threaded processing.")
     parser.add_argument("--num_label", type=int, help="Number of labels")
     parser.add_argument("--use_bpe", type=int, help="")
-    parser.add_argument("--k", type=int, help="Number of words to be tested for replacement.")
-    parser.add_argument("--threshold_pred_score", type=float, help="Positive prediction threshold.")
+    parser.add_argument("--k", type=int,
+                        help="Number of words to be tested for replacement.")
+    parser.add_argument("--threshold_pred_score", type=float,
+                        help="Positive prediction threshold.")
     args = parser.parse_args()
 
     # Return namespace
