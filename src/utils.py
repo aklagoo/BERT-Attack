@@ -67,19 +67,23 @@ def load_dataset(data_path: str) -> List[Tuple[str, int]]:
     return features
 
 
-def load_models(args: argparse.Namespace) -> (BertForMaskedLM, BertForSequenceClassification, BertTokenizer):
+def load_models(args: dict) -> (BertForMaskedLM, BertForSequenceClassification, BertTokenizer):
     """Loads the MLM and classification models along with the tokenizer."""
     # Load tokenizers
-    tokenizer_tgt = BertTokenizer.from_pretrained(args.tgt_path, do_lower_case=True)
+    tokenizer_tgt = BertTokenizer.from_pretrained(args["tgt_path"],
+                                                  do_lower_case=True)
 
     # Load MLM model
-    config_atk = BertConfig.from_pretrained(args.mlm_path)
-    mlm_model = BertForMaskedLM.from_pretrained(args.mlm_path, config=config_atk)
+    config_atk = BertConfig.from_pretrained(args["mlm_path"])
+    mlm_model = BertForMaskedLM.from_pretrained(args["mlm_path"],
+                                                config=config_atk)
     mlm_model.to('cuda')
 
     # Load target model
-    config_tgt = BertConfig.from_pretrained(args.tgt_path, num_labels=args.num_label)
-    tgt_model = BertForSequenceClassification.from_pretrained(args.tgt_path, config=config_tgt)
+    config_tgt = BertConfig.from_pretrained(args["tgt_path"],
+                                            num_labels=args["num_label"])
+    tgt_model = BertForSequenceClassification.from_pretrained(args["tgt_path"],
+                                                              config=config_tgt)
     tgt_model.to('cuda')
 
     return mlm_model, tgt_model, tokenizer_tgt
