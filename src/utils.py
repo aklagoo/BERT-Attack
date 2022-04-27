@@ -1,9 +1,11 @@
-import argparse
 import json
 from dataclasses import dataclass
 from typing import List, Tuple
 import numpy as np
-from transformers import BertForMaskedLM, BertForSequenceClassification, BertTokenizer, BertConfig
+from transformers import BertForMaskedLM, BertForSequenceClassification, \
+    BertTokenizer, BertConfig
+
+ORIG_MISCLASSIFIED = 3
 
 
 @dataclass
@@ -19,8 +21,10 @@ class Feature(object):
         change:
         success:
         sim:
-        changes:
+        changes: Changes to the source sentence. Each entry contains
+        [sub_word_start, substituted_word, target_word].
     """
+
     def __init__(self, seq_a, label):
         self.label: int = label
         self.seq: str = seq_a
@@ -32,7 +36,40 @@ class Feature(object):
         self.changes: list = []
 
 
-def load_similarity_embed(embed_path: str, sim_path: str) -> (np.ndarray, dict, dict):
+@dataclass
+class BigFeature(object):
+    """Stores attack statistics (with text and results) for a sample.
+
+    TODO Complete missing attribute descriptions.
+    Attributes:
+        label: Assigned class.
+        seq: String sequence.
+        orig_probs: Probabilities for the original sequence.
+        adv_texts: List of all adversarial texts.
+        adv_probs: List of all predictions corresponding to texts.
+        query: Total number of queries performed.
+        change: Total number of words changed.
+        success: 
+        sim: Similarity to the original sequence.
+        changes: Changes to the source sentence. Each entry contains
+        [sub_word_start, substituted_word, target_word].
+    """
+
+    def __init__(self, seq_a, label):
+        self.label: int = label
+        self.seq: str = seq_a
+        self.orig_probs: List[float] = []
+        self.adv_texts: List[str] = []
+        self.adv_probs: List[List[float]]
+        self.query: int = 0
+        self.change: int = 0
+        self.success: int = 0
+        self.sim: float = 0.0
+        self.changes: list = []
+
+
+def load_similarity_embed(embed_path: str, sim_path: str) -> (np.ndarray, dict,
+                                                              dict):
     """Loads similarity embedding vectors."""
     idx2word = {}
     word2idx = {}
@@ -67,7 +104,8 @@ def load_dataset(data_path: str) -> List[Tuple[str, int]]:
     return features
 
 
-def load_models(args: dict) -> (BertForMaskedLM, BertForSequenceClassification, BertTokenizer):
+def load_models(args: dict) -> (BertForMaskedLM, BertForSequenceClassification,
+                                BertTokenizer):
     """Loads the MLM and classification models along with the tokenizer."""
     # Load tokenizers
     tokenizer_tgt = BertTokenizer.from_pretrained(args["tgt_path"],
