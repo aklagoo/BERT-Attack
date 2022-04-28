@@ -6,15 +6,16 @@
 # @Author  : Linyang Li
 # @Email   : linyangli19@fudan.edu.cn
 # @File    : attack.py
+import pickle
 import sys
 import warnings
 import os
 import torch
 import argparse
-from src.attack import attack
+from src.attack import attack, attack_infinite
 from src.evaluate import evaluate
 from src.utils import load_similarity_embed, load_dataset, Feature, \
-    dump_features, load_models
+    dump_features, load_models, BigFeature
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 warnings.simplefilter(action='ignore', category=FutureWarning)
@@ -69,6 +70,60 @@ def main(arguments: dict, sim_directory: str = None):
 
     print("\r\tSaving files")
     dump_features(features_output, arguments["output_dir"])
+
+    print("Completed")
+
+
+def dump_features_infinite(features, out_path):
+    with open(os.path.join(out_path, 'infinite.pickle'), 'wb') as file:
+        pickle.dump(features, file)
+
+
+def main_infinite(arguments: dict, sim_directory: str = None):
+    print('Starting process...')
+    # Load required models, tokenizers, and dataset
+    model_mlm, model_target, tokenizer_target = load_models(arguments)
+    samples = load_dataset(arguments["data_path"])
+
+    if arguments["use_sim_mat"] == 1:
+        if sim_directory is None:
+            sim_directory = "data_defense"
+        print('\tLoading similarity embeddings...')
+        cos_mat, w2i, i2w = load_similarity_embed(
+            sim_directory + '/counter-fitted-vectors.txt',
+            sim_directory + '/cos_sim_counter_fitting.npy',
+        )
+    else:
+        cos_mat, w2i, i2w = None, {}, {}
+
+    print("\tPerforming attacks...")
+    features_output = []
+    with torch.no_grad():
+        print()
+        n = arguments["end"] - arguments["start"]
+        for index, feature in enumerate(
+                samples[arguments["start"]:arguments["end"]]
+        ):
+            # Convert sample to object with embedded metrics
+            feature = BigFeature(*feature)
+
+            # Perform attacks on the sample
+            print('\r\t\t[{:d} / {:d}] '.format(index, n), end='')
+            feature = attack_infinite(
+                feature, model_target, model_mlm, tokenizer_target,
+                arguments["k"], batch_size=32, max_length=512, cos_mat=cos_mat,
+                w2i=w2i, use_bpe=arguments["use_bpe"],
+                threshold_pred_score=arguments["threshold_pred_score"]
+            )
+
+            if feature.success > 2:
+                print('Successful', end='')
+            else:
+                print('Failed', end='')
+            features_output.append(feature)
+
+    print("\r\tSaving files")
+    dump_features_infinite(features_output, arguments["output_dir"])
 
     print("Completed")
 
@@ -129,7 +184,7 @@ if __name__ == '__main__':
             "mlm_path": "./bert-base-uncased",
             "tgt_path": "./models/imdbclassifier",
             "use_sim_mat": 0,
-            "output_dir": "data_defense/imdb_logs.tsv",
+            "output_dir": "data_defense",
             "num_label": 2,
             "use_bpe": 1,
             "k": 48,
@@ -139,4 +194,4 @@ if __name__ == '__main__':
         }
     else:
         args = parse_args()
-    main(args)
+    main_infinite(args)

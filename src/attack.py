@@ -6,7 +6,7 @@ from torch import nn as nn
 from torch.utils.data import TensorDataset, SequentialSampler, DataLoader
 from transformers import BertForSequenceClassification, BertTokenizer, \
     BertForMaskedLM
-from src.utils import Feature, ORIG_MISCLASSIFIED, BigFeature
+from src.utils import Feature, ORIG_MISCLASSIFIED, BigFeature, ATTACK_SUCCESSFUL
 
 FILTER_WORDS = [
     'a', 'about', 'above', 'across', 'after', 'afterwards', 'again', 'against',
@@ -470,8 +470,7 @@ def attack_infinite(feature: BigFeature,
                 feature.changes.append(
                     [keys[top_index[0]][0], substitute, tgt_word])
                 feature.final_adverse = temp_text
-                feature.success = 4
-                return feature
+                feature.success = ATTACK_SUCCESSFUL
             else:
 
                 label_prob = temp_prob[orig_label]
