@@ -349,6 +349,7 @@ def attack(feature: Feature, target_model: BertForSequenceClassification,
                     most_gap = gap
                     candidate = substitute
 
+
         if most_gap > 0:
             feature.change += 1
             feature.changes.append([sub_word_i, candidate, target_word])
@@ -458,7 +459,7 @@ def attack_infinite(feature: BigFeature,
                                                    temp_text, max_length)
 
             # Update feature
-            feature.adv_texts.append(temp_text)
+            feature.adv_texts.append((tgt_word, substitute, temp_text))
             feature.adv_probs.append(temp_prob.tolist())
 
             # Increase the number of queries

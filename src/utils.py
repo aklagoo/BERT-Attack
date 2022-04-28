@@ -60,7 +60,7 @@ class BigFeature(object):
         self.label: int = label
         self.seq: str = seq_a
         self.orig_probs: List[float] = []
-        self.adv_texts: List[str] = []
+        self.adv_texts: List[Tuple[str, str, str]] = []
         self.adv_probs: List[List[float]] = []
         self.query: int = 0
         self.change: int = 0
