@@ -6,7 +6,8 @@ from torch import nn as nn
 from torch.utils.data import TensorDataset, SequentialSampler, DataLoader
 from transformers import BertForSequenceClassification, BertTokenizer, \
     BertForMaskedLM
-from src.utils import Feature, ORIG_MISCLASSIFIED, BigFeature, ATTACK_SUCCESSFUL
+from src.utils import Feature, ORIG_MISCLASSIFIED, BigFeature, \
+    ATTACK_SUCCESSFUL, EXCEED_40, ATTACK_EXCEED_40, ATTACK_UNSUCCESSFUL
 
 FILTER_WORDS = [
     'a', 'about', 'above', 'across', 'after', 'afterwards', 'again', 'against',
@@ -100,6 +101,16 @@ def generate_importance_scores(source_sent: List[str],
     """
     Generates importance scores by masking words in the sentences.
 
+    This is performed by masking each word in the sentence and checking the
+    difference in output probabilities.
+
+    For example, consider a sentiment analysis task on a simple sentence before
+    and after masking.
+
+    P('Happy' | "I am very happy.") = 0.9
+    P('Happy' | "I am very [MASK]") = 0.1
+    Importance("happy") = 0.9 - 0.1 = 0.8
+
     Args:
         source_sent: Source sentence tokenized as whole words, i.e., no
          sub-words are used.
@@ -113,9 +124,9 @@ def generate_importance_scores(source_sent: List[str],
 
     Returns:
         A 1-D tensor of importance scores. One for each word, excluding the
-        final period ('.').
+        [SEP] token.
     """
-    # Create a list of masked sentences. Every word except the final '.' token
+    # Create a list of masked sentences. Every word except the final [SEP] token
     # is replaced. This results in the length:
     #     `num_masked = num_words - 1`.
     texts = mask_sentence(source_sent)
@@ -157,7 +168,11 @@ def generate_importance_scores(source_sent: List[str],
     probs = torch.softmax(probs, -1)
     probs_argmax = torch.argmax(probs, dim=-1)
 
-    # Calculate one importance score for each word.
+    # Calculate one importance score for each word. This is calculated using
+    # the sum of two parts:
+    #   1. Difference between the correct label probabilities
+    #   2. The difference between the incorrect label probabilities, if
+    #      misclassified.
     import_scores = orig_prob - probs[:, orig_label] + (probs_argmax !=
                                                         orig_label).float() * (
             probs.max(dim=-1)[0] - torch.index_select(orig_probs, 0,
@@ -171,19 +186,45 @@ def generate_importance_scores(source_sent: List[str],
 
 def get_substitutes(substitutes, tokenizer, mlm_model, use_bpe,
                     substitutes_score=None, threshold=3.0):
-    # substitutes L,k
-    # from this matrix to recover a word
+    """Creates a list of substitute words as a set of strings.
+
+    This method simply filters suggested substitutes by their importance scores
+    and converts them from indices to strings. If they are sub-words, however,
+    a more complex process is followed as described in get_bpe_substitutes.
+
+    An example of a sub word is:
+        Let's = Let + ' + s
+
+    Args:
+        substitutes: A list of indices of suggested substitutes for the word.
+        tokenizer: A tokenizer for converting words back to tokens.
+        mlm_model: A BERT instance to be used if a word consists of sub-words
+        use_bpe: Checks if sub-words are to be replaced.
+        substitutes_score: A list of scores corresponding to substitutes.
+        threshold: A threshold for importance scores for words to be considered.
+
+    Returns:
+
+    """
     words = []
     sub_len, k = substitutes.size()  # sub-len, k
 
+    # If the word is empty, return.
     if sub_len == 0:
         return words
 
+    # If it only contains a single sub-word, i.e., it's a complete word,
+    # check all the substitutes for the word and convert them to strings.
     elif sub_len == 1:
         for (i, j) in zip(substitutes[0], substitutes_score[0]):
+            # If it's a valid word and is unimportant, discard it and return.
             if threshold != 0 and j < threshold:
                 break
             words.append(tokenizer._convert_id_to_token(int(i)))
+
+    # Otherwise, we know that there are multiple sub-words in the sentence.
+    # If sub-words are allowed to be used, check their substitutes. Otherwise,
+    # return.
     else:
         if use_bpe == 1:
             words = get_bpe_substitutes(substitutes, tokenizer, mlm_model)
@@ -194,11 +235,36 @@ def get_substitutes(substitutes, tokenizer, mlm_model, use_bpe,
 
 
 def get_bpe_substitutes(substitutes, tokenizer, mlm_model):
-    # substitutes L, k
+    """Generates substitutes for sub-words.
+
+    The input is a set of substitutes, k substitutes for each sub-word.
+    Consider an example of the sentence "Let's go." Assuming that we select the
+    word "Let's", we get 48 words for "Let", "'", and "s" each, creating a
+    vector of size (3 x 48).
+
+    We create some N combinations of these substitutes, obtaining N triplets.
+    The resulting vector has a size (N x 3).
+
+    Now, we calculate the perplexity of each triplet. Perplexity is roughly
+    the opposite of the likelihood of encountering a combination of words.
+    The lower the likelihood of the triplet, the more likely it is to be
+    encountered naturally.
+
+    Finally, these combinations are ranked, stringified and returned.
+
+    Args:
+        substitutes: The set of substitutes for each sub-word.
+        tokenizer: BERT tokenizer for index to string conversion.
+        mlm_model: Language model to calculate perplexity.
+
+    Returns:
+        List of substitute words for the input set of sub-words.
+    """
+    # k suggested substitutes for L sub-words.
     substitutes = substitutes[0:12, 0:4]  # maximum BPE candidates
 
-    # find all possible candidates
-
+    # Generate all the possible combinations of suggested sub-words, similar to
+    # a cartesian product.
     all_substitutes = []
     for i in range(substitutes.size(0)):
         if len(all_substitutes) == 0:
@@ -211,20 +277,31 @@ def get_bpe_substitutes(substitutes, tokenizer, mlm_model):
                     lev_i.append(all_sub + [int(j)])
             all_substitutes = lev_i
 
-    # all substitutes  list of list of token-id (all candidates)
+    # Initialize loss function to calculate perplexity.
     c_loss = nn.CrossEntropyLoss(reduction='none')
-    # word_list = []
-    # all_substitutes = all_substitutes[:24]
+
+    # Convert to a tensor and reduce the number of combinations. The resulting
+    # tensor contains N sets consisting of L words each. So, every element is
+    # a set of sub-words replacing the original word.
     all_substitutes = torch.tensor(all_substitutes)  # [ N, L ]
     all_substitutes = all_substitutes[:24].to('cuda')
-    # print(substitutes.size(), all_substitutes.size())
+
     N, L = all_substitutes.size()
+
+    # Get probable words for all combinations
     word_predictions = mlm_model(all_substitutes)[0]  # N L vocab-size
+
+    # Calculate the perplexity for all words combinations using selective loss
+    # like cross entropy. The operation calculates perplexity as a loss for
+    # every triplet.
     ppl = c_loss(word_predictions.view(N * L, -1),
                  all_substitutes.view(-1))  # [ N*L ]
     ppl = torch.exp(torch.mean(ppl.view(N, L), dim=-1))  # N
+
+    # Sort the word substitutes sets by their perplexity
     _, word_list = torch.sort(ppl)
     word_list = [all_substitutes[i] for i in word_list]
+
     final_words = []
     for word in word_list:
         tokens = [tokenizer._convert_id_to_token(int(i)) for i in word]
@@ -238,9 +315,52 @@ def attack(feature: Feature, target_model: BertForSequenceClassification,
            batch_size: int, max_length: int = 512,
            cos_mat: Optional[np.ndarray] = None, w2i: Optional[dict] = None,
            use_bpe: int = 1,
-           threshold_pred_score: float = 0.3
+           threshold_pred_score: float = 0.3, word_sim: float = 0.4
            ):
-    """Performs all substitution attacks on the BERT model."""
+    """Performs all substitution attacks on the BERT model.
+
+    This function performs attacks on a single sentence. The process is as
+    follows:
+        1. Pre-process the sentence.
+        2. Consider every word in the sentence and judge how important it is to
+        the classifier, which is guessed by how much the output is changed by
+        the absence of this word.
+        3. If the classifier misclassifies the sentence, stop.
+        3. Sort these words based on their importance and pick the top k words
+        to replace.
+        4. For each word, do the following:
+            i.   Generate a substitute word using the language model BERT. This
+            is performed by hiding the word and asking BERT to predict it.
+            ii.   If more than 40% words in the sentence have been tried, stop.
+            iii. Otherwise, generate substitutes.
+            iv.  For each substitute, check if the modified sentence
+            successfully tricks the classifier. If so, end. Otherwise, keep
+            trying.
+        5. If no attacks are successful, return the failure.
+
+
+    Args:
+        feature: An initialized Feature object. Only the sequence is assigned
+        a valid value.
+        target_model: The victim classifier.
+        mlm_model: The MLM BERT instance.
+        k: The number of words to be considered while attacking.
+        batch_size: The batch size while generating importance scores.
+        max_length: The length to which a sentence should be padded for a
+        uniform size.
+        cos_mat: The cosine similarity matrix to compare words.
+        w2i: A map converting word strings to indices for cos_mat.
+        use_bpe: Decides whether substitutes are to be generated for tokens
+        smaller than a word.
+        threshold_pred_score: Decides whether a sub-word is to be discarded when
+        generating substitutions. It is compared to the sub-word's importance
+        score.
+        word_sim: Controls how close the words must be. If the cosine similarity
+        of a substitute is greater than word_sim, it is discarded.
+
+    Returns:
+        A utility class Feature containing attack and sentence statistics.
+    """
     # MLM-process
     if w2i is None:
         w2i = {}
@@ -287,7 +407,7 @@ def attack(feature: Feature, target_model: BertForSequenceClassification,
 
         # Do not exceed 40% of the sentence.
         if feature.change > int(0.4 * (len(words))):
-            feature.success = 1  # exceed
+            feature.success = ATTACK_EXCEED_40  # exceed
             return feature
 
         # Discard filter words.
@@ -318,7 +438,7 @@ def attack(feature: Feature, target_model: BertForSequenceClassification,
                     FILTER_WORDS or (substitute in w2i and target_word in w2i
                                      and cos_mat[w2i[substitute]]
                                      [w2i[target_word]] <
-                                     0.4):
+                                     word_sim):
                 continue
 
             # Generate text for prediction
@@ -339,7 +459,7 @@ def attack(feature: Feature, target_model: BertForSequenceClassification,
                 feature.changes.append(
                     [sub_word_i, substitute, target_word])
                 feature.final_adverse = temp_text
-                feature.success = 4
+                feature.success = ATTACK_SUCCESSFUL
                 return feature
             else:
 
@@ -357,7 +477,7 @@ def attack(feature: Feature, target_model: BertForSequenceClassification,
             final_words[word_idx] = candidate
 
     feature.final_adverse = (tokenizer.convert_tokens_to_string(final_words))
-    feature.success = 2
+    feature.success = ATTACK_UNSUCCESSFUL
     return feature
 
 
@@ -369,9 +489,46 @@ def attack_infinite(feature: BigFeature,
                     cos_mat: Optional[np.ndarray] = None,
                     w2i: Optional[dict] = None,
                     use_bpe: int = 1,
-                    threshold_pred_score: float = 0.3
+                    threshold_pred_score: float = 0.3,
+                    word_sim: float = 0.4
                     ) -> BigFeature:
-    """Performs all substitution attacks on the BERT model."""
+    """Performs all substitution attacks on the BERT model.
+
+    Most of the implementation is similar to `attack`. There are only two
+    modifications made:
+        1. The attacks aren't stopped after the first success. All attacks are
+        performed until 40% of the words in the sentence have been tried.
+        2. Even if the original classifier misclassifies the sample, the attacks
+        are continued.
+        3. For each individual substitution attack, the following information is
+        stored:
+            a. Original word
+            b. Substituted word
+            c. Adversarial text
+            d. Classifier probabilities on adversarial text.
+
+    Args:
+        feature: An initialized BigFeature object. Only the sequence is assigned
+        a valid value.
+        target_model: The victim classifier.
+        mlm_model: The MLM BERT instance.
+        k: The number of words to be considered while attacking.
+        batch_size: The batch size while generating importance scores.
+        max_length: The length to which a sentence should be padded for a
+        uniform size.
+        cos_mat: The cosine similarity matrix to compare words.
+        w2i: A map converting word strings to indices for cos_mat.
+        use_bpe: Decides whether substitutes are to be generated for tokens
+        smaller than a word.
+        threshold_pred_score: Decides whether a sub-word is to be discarded when
+        generating substitutions. It is compared to the sub-word's importance
+        score.
+        word_sim: Controls how close the words must be. If the cosine similarity
+        of a substitute is greater than word_sim, it is discarded.
+
+    Returns:
+        A utility class BigFeature containing attack and sentence statistics.
+    """
     # MLM-process
     if w2i is None:
         w2i = {}
@@ -414,7 +571,7 @@ def attack_infinite(feature: BigFeature,
 
         # Do not exceed 40% of the sentence.
         if feature.change > int(0.4 * (len(words))):
-            feature.success = 1  # exceed
+            feature.success = ATTACK_EXCEED_40  # exceed
             return feature
 
         # Discard filter words.
@@ -446,20 +603,26 @@ def attack_infinite(feature: BigFeature,
                             '##' in substitute or \
                             substitute in FILTER_WORDS or \
                             (substitute in w2i and tgt_word in w2i and
-                             cos_mat[w2i[substitute]][w2i[tgt_word]] < 0.4):
+                             cos_mat[w2i[substitute]][w2i[tgt_word]] < word_sim):
                 continue
 
             # Generate text for prediction
             temp_replace = final_words
-            temp_replace[top_index[0]] = substitute
+            temp_replace[word_idx] = substitute
             temp_text = tokenizer.convert_tokens_to_string(temp_replace)
+
+            # Generate masked sentence
+            masked_sentence = [x for x in final_words]
+            masked_sentence[word_idx] = tokenizer.mask_token
+            masked_sentence = tokenizer.convert_tokens_to_string(masked_sentence)
 
             # Perform prediction
             temp_label, temp_prob = predict_target(target_model, tokenizer,
                                                    temp_text, max_length)
 
             # Update feature
-            feature.adv_texts.append((tgt_word, substitute, temp_text))
+            feature.adv_texts.append((tgt_word, substitute, masked_sentence,
+                                      temp_text))
             feature.adv_probs.append(temp_prob.tolist())
 
             # Increase the number of queries
@@ -487,7 +650,7 @@ def attack_infinite(feature: BigFeature,
             final_words[top_index[0]] = candidate
 
     feature.final_adverse = (tokenizer.convert_tokens_to_string(final_words))
-    feature.success = 2
+    feature.success = ATTACK_UNSUCCESSFUL
     return feature
 
 

@@ -27,6 +27,7 @@ def main(arguments: dict, sim_directory: str = None):
     model_mlm, model_target, tokenizer_target = load_models(arguments)
     samples = load_dataset(arguments["data_path"])
 
+    # Load the similarity matrix
     if arguments["use_sim_mat"] == 1:
         if sim_directory is None:
             sim_directory = "data_defense"
@@ -55,7 +56,8 @@ def main(arguments: dict, sim_directory: str = None):
                 feature, model_target, model_mlm, tokenizer_target,
                 arguments["k"], batch_size=32, max_length=512, cos_mat=cos_mat,
                 w2i=w2i, use_bpe=arguments["use_bpe"],
-                threshold_pred_score=arguments["threshold_pred_score"]
+                threshold_pred_score=arguments["threshold_pred_score"],
+                word_sim=arguments["word_sim"]
             )
 
             if feature.success > 2:
@@ -66,12 +68,14 @@ def main(arguments: dict, sim_directory: str = None):
 
     # Evaluate and save
     print("\r\tEvaluating performance")
-    evaluate(features_output)
+    after_atk, query, change_rate = evaluate(features_output)
 
     print("\r\tSaving files")
     dump_features(features_output, arguments["output_dir"])
 
     print("Completed")
+
+    return after_atk, query, change_rate
 
 
 def dump_features_infinite(features, out_path):
@@ -85,6 +89,7 @@ def main_infinite(arguments: dict, sim_directory: str = None):
     model_mlm, model_target, tokenizer_target = load_models(arguments)
     samples = load_dataset(arguments["data_path"])
 
+    # Load the similarity matrix
     if arguments["use_sim_mat"] == 1:
         if sim_directory is None:
             sim_directory = "data_defense"
@@ -113,7 +118,8 @@ def main_infinite(arguments: dict, sim_directory: str = None):
                 feature, model_target, model_mlm, tokenizer_target,
                 arguments["k"], batch_size=32, max_length=512, cos_mat=cos_mat,
                 w2i=w2i, use_bpe=arguments["use_bpe"],
-                threshold_pred_score=arguments["threshold_pred_score"]
+                threshold_pred_score=arguments["threshold_pred_score"],
+                word_sim=arguments["word_sim"]
             )
 
             if feature.success > 2:
@@ -131,6 +137,8 @@ def main_infinite(arguments: dict, sim_directory: str = None):
 def parse_args() -> dict:
     """Load and parse arguments.
 
+    Converts each
+
     The parser accepts the following arguments:
         data_path: Path to the TSV dataset file.
         mlm_path: Path to the directory containing the MLM model.
@@ -141,7 +149,7 @@ def parse_args() -> dict:
         start: Starting step. Usable for multi-threaded processing.
         start: Ending step. Usable for multi-threaded processing.
         num_label: Number of labels.
-        use_bpe: TODO Read about BPE and fill in
+        use_bpe: Decides whether to use byte-pair encoding or not.
         k: Number of words to be tested for replacement.
         threshold_pred_score: Positive prediction threshold.
     """
@@ -170,6 +178,8 @@ def parse_args() -> dict:
                         help="Number of words to be tested for replacement.")
     parser.add_argument("--threshold_pred_score", type=float,
                         help="Positive prediction threshold.")
+    parser.add_argument("--word_sim", type=float,
+                        help="Word similarity.")
     arguments = parser.parse_args()
 
     # Return namespace
@@ -190,7 +200,8 @@ if __name__ == '__main__':
             "k": 48,
             "start": 0,
             "end": 1,
-            "threshold_pred_score": 0
+            "threshold_pred_score": 0,
+            "word_sim": 0.4,
         }
     else:
         args = parse_args()

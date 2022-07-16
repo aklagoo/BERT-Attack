@@ -3,7 +3,13 @@ import tensorflow_hub as hub
 
 
 class USE(object):
+    """Class for generating sentence similarities.
+
+    This class uses Universal Sentence Encoder (USE) and loads it from the cache path.
+    The code uses Tensorflow v1.
+    """
     def __init__(self, cache_path):
+        """Loads and initializes USE and initializes unassigned variables."""
         super(USE, self).__init__()
 
         self.embed = hub.Module(cache_path)
@@ -19,6 +25,7 @@ class USE(object):
         self.sim_scores = None
 
     def build_graph(self):
+        """Loads the tensorflow execution graph for similarity calculation."""
         self.sts_input1 = tf.placeholder(tf.string, shape=None)
         self.sts_input2 = tf.placeholder(tf.string, shape=None)
 
@@ -31,6 +38,7 @@ class USE(object):
         self.sim_scores = 1.0 - tf.acos(clip_cosine_similarities)
 
     def semantic_sim(self, sentences1, sentences2):
+        """Calculates similarity between two sentences."""
         sentences1 = [s.lower() for s in sentences1]
         sentences2 = [s.lower() for s in sentences2]
         scores = self.sess.run(
@@ -43,14 +51,20 @@ class USE(object):
 
 
 def evaluate(features):
-    """Evaluate model"""
+    """Evaluates the model performance.
+
+    It calculates three key metrics:
+        1. Change rate: The number of words before success.
+        2. Accuracy: The accuracy of the model after attack.
+        3. Query number: The average number of queries to the first success.
+    """
     do_use = 0
     use = None
     sim_threshold = 0
 
     # evaluate with USE
     if do_use == 1:
-        cache_path = ''
+        cache_path = 'models/use'
         use = USE(cache_path)
 
     acc = 0
@@ -87,3 +101,5 @@ def evaluate(features):
 
     print('acc/aft-atk-acc {:.6f}/ {:.6f}, query-num {:.4f}, change-rate {:.4f}'
           ''.format(origin_acc, after_atk, query, change_rate))
+
+    return after_atk, query, change_rate

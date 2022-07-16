@@ -1,5 +1,5 @@
-/data_defense/
+/.ipynb_checkpoints/
+/attacked_data/
 /bert-base-uncased/
+/data_defense/
 /models/
-/.idea/
-BERT-Attack.7z
